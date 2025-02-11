@@ -1,0 +1,1161 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>60 FPS Fluid & Rigid–Body Simulation with Stackable Rounded Boxes and Drag Arrow</title>
+  <!-- Include p5.js library -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.4.2/p5.min.js"></script>
+  <style>
+    body { margin: 0; overflow: hidden; }
+  </style>
+</head>
+<body>
+  <script>
+    /***************** GLOBAL VARIABLES & CONSTANTS *****************/
+    const SIMPLE_COLLISION_THRESHOLD = 0.2;  // Overlap threshold for boxes
+    const BOX_CORNER_RADIUS = 20; // Maximum corner radius for rounded boxes
+
+    // Particle count modes – default is 2k; others: 2k, 5k, 7k, 10k, 15k, 20k.
+    let particleCounts = [2000, 5000, 7000, 10000, 15000, 20000];
+    let currentParticleCountIndex = 0;  // Start with 2k particles
+    let activeParticleCount = particleCounts[currentParticleCountIndex];
+    let maxParticles = Math.max(...particleCounts);
+    let particles = new Array(maxParticles);
+
+    // Boxes are fixed: always 80 cm square and 100 kg.
+    let boxes = [];
+
+    // Simulation parameters:
+    // Gravity is fixed at 0.1 (to aid stacking).
+    let gravityVal = 0.1;
+    let wallShakeVal = 400; // For wave types 1–3
+    let particleRadius = 3;
+    let cellSize = 10;
+
+    // UI sliders (only adjustable ones remain):
+    let gravitySlider, wallShakeSlider, wallShakeFreqSlider, particleSizeSlider, gravityAngleSlider;
+    let bubbleBaseSlider, bubbleAmpSlider; // For wave type 4 (Expanding Bubble)
+    // <<-- NEW: Attraction slider for pulling boxes toward the mouse
+    let attractionSlider;
+
+    // Toggle buttons:
+    let explanationButton, infoButton, waveButton, particleCountButton, resetButton;
+    let showExplanation = false;
+    let showInfo = false;
+
+    // Wave maker types:
+    //   1: Oscillating vertical wall  
+    //   2: Sinusoidal bottom wave  
+    //   3: Noise–based bottom wave  
+    //   4: Expanding Bubble (water is confined in a pulsating bubble)
+    let waveType = 1;
+    let waveRes = 10;
+    let waveArray = [];
+
+    // Spawn parameters:
+    let spawnCenter;  // Where new particles spawn.
+    let spawnRadius = 70;
+
+    // Explanation overlay text.
+    let explanationText =
+      "Fluid and Rigid–Body Simulation\n" +
+      "---------------------------------\n" +
+      "- Water particles simulate fluid dynamics\n" +
+      "- Press 'p' to add a new box (always 100 KG, 80 cm)\n" +
+      "- Remove last box with Ctrl+Z (Cmd+Z on Mac)\n" +
+      "- Use sliders to adjust parameters (except box properties)\n" +
+      "- Blue water blob shows pressure levels\n" +
+      "\n" +
+      "Wave Types:\n" +
+      "   1: Oscillating vertical wall\n" +
+      "   2: Sinusoidal bottom wave\n" +
+      "   3: Noise–based bottom wave\n" +
+      "   4: Expanding Bubble (water is confined in a pulsating bubble)\n" +
+      "Red arrows show water particle velocity (filtered to avoid overlaps).\n" +
+      "Press 'particles' to cycle the particle count (2k, 5k, 7k, 10k, 15k, 20k).\n" +
+      "New particles spawn from the red circle (spawn area).\n" +
+      "Press RESET to restart the simulation.\n" +
+      "\n" +
+      "Instead of dragging boxes directly, when you click on a box it will accelerate toward the mouse.\n" +
+      "In info mode, each box shows a black arrow (its travel direction) and an orange arrow\n" +
+      "indicating the drag deceleration (i.e. the force slowing it down).";
+
+    // Spatial grid for water particles:
+    let grid = [];
+    let gridCols = 0, gridRows = 0;
+
+    // For water arrow selections (for drawing red arrows) – these reset when particle count changes.
+    let arrowSelections = {};
+    let lastInfoUpdate = 0;
+    const infoUpdateInterval = 1500; // ms
+    const infoCellSize = 15; // for grid-based arrow selection
+
+    // Global density array for the water blob:
+    let density = [];
+    let densityCols = 0, densityRows = 0;
+
+    // Constant neighbor offsets for grid collision detection.
+    const neighborOffsets = [
+      [-1, -1], [-1, 0], [-1, 1],
+      [ 0, -1], [ 0, 0], [ 0, 1],
+      [ 1, -1], [ 1, 0], [ 1, 1]
+    ];
+
+    // --- Wave Type 4: Expanding Bubble ---
+    function getBubbleRadius() {
+      return bubbleBaseSlider.value() + bubbleAmpSlider.value() * sin(frameCount * 0.05);
+    }
+
+    /***************** HELPER FUNCTIONS *****************/
+
+    function formatParticleCount(n) {
+      return (n / 1000) + "k";
+    }
+
+    // Build (or clear) the spatial grid.
+    function buildGrid() {
+      gridCols = Math.ceil(width / cellSize);
+      gridRows = Math.ceil(height / cellSize);
+      const totalCells = gridCols * gridRows;
+      for (let i = 0; i < totalCells; i++) {
+        if (!grid[i]) grid[i] = [];
+        grid[i].length = 0;
+      }
+      const ap = activeParticleCount;
+      for (let i = 0; i < ap; i++) {
+        let p = particles[i];
+        let col = p.x / cellSize | 0;
+        let row = p.y / cellSize | 0;
+        col = col < 0 ? 0 : (col >= gridCols ? gridCols - 1 : col);
+        row = row < 0 ? 0 : (row >= gridRows ? gridRows - 1 : row);
+        grid[row * gridCols + col].push(p);
+      }
+    }
+
+    // Returns the water level (y-value) for wave types 2 and 3.
+    function getWaveY(x) {
+      let waveOffset = frameCount * wallShakeFreqSlider.value() * 2;
+      if (waveType === 2) {
+        return height - wallShakeVal * ((sin((x / width) * TWO_PI + waveOffset) + 1) / 2);
+      } else if (waveType === 3) {
+        return height - wallShakeVal * noise(x * 0.01 + waveOffset);
+      }
+      return height;
+    }
+
+    // Toggle particle count (and reset water arrow selections).
+    function toggleParticles() {
+      arrowSelections = {}; // Reset water arrow selections.
+      currentParticleCountIndex = (currentParticleCountIndex + 1) % particleCounts.length;
+      let newCount = particleCounts[currentParticleCountIndex];
+      particleCountButton.html("Particles: " + formatParticleCount(newCount));
+      if (newCount > activeParticleCount) {
+        for (let i = activeParticleCount; i < newCount; i++) {
+          let angle = random(TWO_PI);
+          let r = random(spawnRadius);
+          if (!particles[i]) {
+            particles[i] = new Particle(spawnCenter.x + r * cos(angle), spawnCenter.y + r * sin(angle));
+            particles[i].vx = random(-1, 1);
+            particles[i].vy = random(-3, -1);
+          } else {
+            particles[i].x = spawnCenter.x + r * cos(angle);
+            particles[i].y = spawnCenter.y + r * sin(angle);
+            particles[i].vx = random(-1, 1);
+            particles[i].vy = random(-3, -1);
+          }
+        }
+      }
+      activeParticleCount = newCount;
+    }
+
+    // Toggle wave type.
+    function toggleWave() {
+      waveType = (waveType % 4) + 1;
+      waveButton.html("wave: type " + waveType);
+    }
+
+    // Reset the simulation.
+    function resetEverything() {
+      gravityVal = 0.1;
+      wallShakeVal = 400;
+      particleRadius = 3;
+      gravitySlider.value(gravityVal);
+      wallShakeSlider.value(wallShakeVal);
+      wallShakeFreqSlider.value(0.05);
+      particleSizeSlider.value(particleRadius);
+      // Box properties are fixed; no sliders for them.
+      gravityAngleSlider.value(PI / 2);
+      bubbleBaseSlider.value(min(width, height) * 0.45);
+      bubbleAmpSlider.value(30);
+      showExplanation = false;
+      showInfo = false;
+      waveType = 1;
+      waveButton.html("wave: type " + waveType);
+      currentParticleCountIndex = 0;
+      particleCountButton.html("Particles: " + formatParticleCount(particleCounts[currentParticleCountIndex]));
+      activeParticleCount = particleCounts[currentParticleCountIndex];
+      boxes = [];
+      arrowSelections = {};
+      spawnCenter = createVector(width / 2, 50);
+      for (let i = 0; i < activeParticleCount; i++) {
+        let angle = random(TWO_PI);
+        let r = random(spawnRadius);
+        if (!particles[i]) {
+          particles[i] = new Particle(spawnCenter.x + r * cos(angle), spawnCenter.y + r * sin(angle));
+        } else {
+          particles[i].x = spawnCenter.x + r * cos(angle);
+          particles[i].y = spawnCenter.y + r * sin(angle);
+          particles[i].vx = random(-1, 1);
+          particles[i].vy = random(-3, -1);
+        }
+      }
+    }
+
+    /***************** ROUNDED BOX HELPER FUNCTION *****************/
+    // Generates an array of vertices approximating a rounded rectangle.
+    function getRoundedBoxPolygon(box) {
+      let cornerRadius = min(BOX_CORNER_RADIUS, box.w / 2, box.h / 2);
+      let numPointsPerCorner = 4;
+      let vertices = [];
+      let hw = box.w / 2, hh = box.h / 2;
+      let tl = createVector(-hw + cornerRadius, -hh + cornerRadius);
+      let tr = createVector(hw - cornerRadius, -hh + cornerRadius);
+      let br = createVector(hw - cornerRadius, hh - cornerRadius);
+      let bl = createVector(-hw + cornerRadius, hh - cornerRadius);
+      // Top-left arc: from PI to 3PI/2.
+      for (let i = 0; i <= numPointsPerCorner; i++) {
+        let a = PI + i * (HALF_PI / numPointsPerCorner);
+        vertices.push(createVector(tl.x + cornerRadius * cos(a), tl.y + cornerRadius * sin(a)));
+      }
+      // Top-right arc: from 3PI/2 to 0.
+      for (let i = 0; i <= numPointsPerCorner; i++) {
+        let a = (3 * PI / 2) + i * (HALF_PI / numPointsPerCorner);
+        vertices.push(createVector(tr.x + cornerRadius * cos(a), tr.y + cornerRadius * sin(a)));
+      }
+      // Bottom-right arc: from 0 to PI/2.
+      for (let i = 0; i <= numPointsPerCorner; i++) {
+        let a = 0 + i * (HALF_PI / numPointsPerCorner);
+        vertices.push(createVector(br.x + cornerRadius * cos(a), br.y + cornerRadius * sin(a)));
+      }
+      // Bottom-left arc: from PI/2 to PI.
+      for (let i = 0; i <= numPointsPerCorner; i++) {
+        let a = HALF_PI + i * (HALF_PI / numPointsPerCorner);
+        vertices.push(createVector(bl.x + cornerRadius * cos(a), bl.y + cornerRadius * sin(a)));
+      }
+      // Rotate and translate the vertices.
+      for (let i = 0; i < vertices.length; i++) {
+        vertices[i] = rotateVector(vertices[i], box.angle).add(box.pos);
+      }
+      return vertices;
+    }
+    // Use the rounded polygon for collision detection.
+    function getBoxCorners(box) {
+      return getRoundedBoxPolygon(box);
+    }
+
+    /***************** CLASS DEFINITIONS *****************/
+
+    // PARTICLE CLASS (using plain number arithmetic)
+    class Particle {
+      static nextId = 0;
+      constructor(x, y) {
+        this.id = Particle.nextId++;
+        this.x = x;
+        this.y = y;
+        this.vx = 0;
+        this.vy = 0;
+        this.ax = 0;
+        this.ay = 0;
+        this.r = particleRadius;
+      }
+      applyForce(fx, fy) {
+        this.ax += fx;
+        this.ay += fy;
+      }
+      update() {
+        this.vx += this.ax;
+        this.vy += this.ay;
+        this.x += this.vx;
+        this.y += this.vy;
+        this.ax = 0;
+        this.ay = 0;
+      }
+      checkEdges(boundaryX, bubbleBoundary) {
+        if (waveType === 4) {
+          let cx = width / 2, cy = height / 2;
+          let dx = this.x - cx, dy = this.y - cy;
+          let d = sqrt(dx * dx + dy * dy);
+          let br = (bubbleBoundary !== undefined) ? bubbleBoundary : getBubbleRadius();
+          if (d + this.r > br) {
+            let overlap = (d + this.r) - br;
+            let nx = dx / d, ny = dy / d;
+            this.x -= nx * overlap;
+            this.y -= ny * overlap;
+            let sepVel = this.vx * nx + this.vy * ny;
+            if (sepVel > 0) {
+              this.vx -= 2 * sepVel * nx;
+              this.vy -= 2 * sepVel * ny;
+              this.vx *= 0.5;
+              this.vy *= 0.5;
+            }
+          }
+        }
+        else if (waveType === 1) {
+          if (this.y > height - this.r) { this.y = height - this.r; this.vy *= -0.5; }
+          if (this.y < this.r) { this.y = this.r; this.vy *= -0.5; }
+          if (this.x < this.r) { this.x = this.r; this.vx *= -0.5; }
+          if (this.x > boundaryX - this.r) { this.x = boundaryX - this.r; this.vx *= -0.5; }
+        }
+        else {
+          if (this.y > height - this.r) { this.y = height - this.r; this.vy *= -0.5; }
+          if (this.y < this.r) { this.y = this.r; this.vy *= -0.5; }
+          if (this.x < this.r) { this.x = this.r; this.vx *= -0.5; }
+          let xIndex = Math.floor(this.x / waveRes);
+          xIndex = constrain(xIndex, 0, waveArray.length - 1);
+          let waveY = waveArray[xIndex];
+          if (this.y + this.r > waveY) { this.y = waveY - this.r; this.vy *= -0.5; }
+        }
+      }
+      checkWallCollisions(wallSegments) {
+        for (let i = 0, n = wallSegments.length; i < n; i++) {
+          let wall = wallSegments[i];
+          let Ax = wall.start.x, Ay = wall.start.y;
+          let Bx = wall.end.x, By = wall.end.y;
+          let Px = this.x, Py = this.y;
+          let ABx = Bx - Ax, ABy = By - Ay;
+          let APx = Px - Ax, APy = Py - Ay;
+          let ab2 = ABx * ABx + ABy * ABy;
+          let t = constrain((APx * ABx + APy * ABy) / ab2, 0, 1);
+          let ClosestX = Ax + ABx * t;
+          let ClosestY = Ay + ABy * t;
+          let dx = this.x - ClosestX, dy = this.y - ClosestY;
+          let d = sqrt(dx * dx + dy * dy);
+          if (d < this.r) {
+            let overlap = this.r - d;
+            let nx = dx / d, ny = dy / d;
+            this.x += nx * overlap;
+            this.y += ny * overlap;
+            let sepVel = this.vx * nx + this.vy * ny;
+            if (sepVel < 0) {
+              let impulse = -2 * sepVel;
+              this.vx += nx * impulse;
+              this.vy += ny * impulse;
+              this.vx *= 0.5;
+              this.vy *= 0.5;
+            }
+          }
+        }
+      }
+    }
+
+    // BOX CLASS (fixed mass & size; no continuous damping)
+    class Box {
+      static nextId = 0;
+      constructor(x, y, w, h, mass) {
+        this.id = Box.nextId++;
+        this.pos = createVector(x, y);
+        this.w = w;
+        this.h = h;
+        this.mass = mass;
+        this.vel = createVector(0, 0);
+        this.acc = createVector(0, 0);
+        this.angle = 0;
+        this.angularVel = 0;
+        this.angularAcc = 0;
+        this.inertia = (this.mass / 12) * (this.w * this.w + this.h * this.h);
+      }
+      applyForce(f) {
+        this.acc.x += f.x / this.mass;
+        this.acc.y += f.y / this.mass;
+      }
+      applyTorque(t) {
+        this.angularAcc += t / this.inertia;
+      }
+      update() {
+        // Always update physics.
+        this.angularVel += this.angularAcc;
+        this.angle += this.angularVel;
+        this.angularAcc = 0;
+        this.vel.add(this.acc);
+        this.pos.add(this.vel);
+        this.acc.set(0, 0);
+      }
+      // For water collisions (non–waveType 1 or 4), clamp the bottom to the water surface.
+      checkEdges() {
+        if (waveType === 4) {
+          let cx = width / 2, cy = height / 2;
+          let dx = this.pos.x - cx, dy = this.pos.y - cy;
+          let d = sqrt(dx * dx + dy * dy);
+          let bubbleRadius = getBubbleRadius();
+          let boxBound = sqrt((this.w / 2) ** 2 + (this.h / 2) ** 2);
+          if (d + boxBound > bubbleRadius) {
+            let overlap = (d + boxBound) - bubbleRadius;
+            let nx = dx / d, ny = dy / d;
+            this.pos.x -= nx * overlap;
+            this.pos.y -= ny * overlap;
+            let sepVel = this.vel.x * nx + this.vel.y * ny;
+            if (sepVel > 0) {
+              this.vel.x -= 2 * sepVel * nx;
+              this.vel.y -= 2 * sepVel * ny;
+            }
+          }
+        }
+        else if (waveType === 1) {
+          let halfW = abs(cos(this.angle)) * (this.w / 2) + abs(sin(this.angle)) * (this.h / 2);
+          let halfH = abs(sin(this.angle)) * (this.w / 2) + abs(cos(this.angle)) * (this.h / 2);
+          if (this.pos.x - halfW < 0) { this.pos.x = halfW; this.vel.x *= -0.5; }
+          if (this.pos.x + halfW > rightWall) { this.pos.x = rightWall - halfW; this.vel.x *= -0.5; }
+          if (this.pos.y - halfH < 0) { this.pos.y = halfH; this.vel.y *= -0.5; }
+          if (this.pos.y + halfH > height) { this.pos.y = height - halfH; this.vel.y *= -0.5; }
+        }
+        else {
+          let halfW = abs(cos(this.angle)) * (this.w / 2) + abs(sin(this.angle)) * (this.h / 2);
+          let halfH = abs(sin(this.angle)) * (this.w / 2) + abs(cos(this.angle)) * (this.h / 2);
+          if (this.pos.x - halfW < 0) { this.pos.x = halfW; this.vel.x *= -0.5; }
+          if (this.pos.x + halfW > width) { this.pos.x = width - halfW; this.vel.x *= -0.5; }
+          if (this.pos.y - halfH < 0) { this.pos.y = halfH; this.vel.y *= -0.5; }
+          let xIndex = Math.floor(this.pos.x / waveRes);
+          xIndex = constrain(xIndex, 0, waveArray.length - 1);
+          let waveY = waveArray[xIndex];
+          if (this.pos.y + halfH > waveY) {
+            this.pos.y = waveY - halfH;
+            this.vel.y = 0;
+          }
+        }
+        // NEW: If the box’s center is nearly off‐screen (within 5 pixels of left/right/above),
+        // constrain its x and y so that it stays on the water surface.
+        if (this.pos.x < -5 || this.pos.x > width + 5 || this.pos.y < -5) {
+          this.pos.x = constrain(this.pos.x, 5, width - 5);
+          let halfH;
+          if (waveType === 1) {
+            halfH = abs(sin(this.angle)) * (this.h / 2) + abs(cos(this.angle)) * (this.w / 2);
+            this.pos.y = height - halfH;
+          } else {
+            halfH = abs(sin(this.angle)) * (this.h / 2) + abs(cos(this.angle)) * (this.w / 2);
+            let xIndex = Math.floor(this.pos.x / waveRes);
+            xIndex = constrain(xIndex, 0, waveArray.length - 1);
+            let waveY = waveArray[xIndex];
+            this.pos.y = waveY - halfH;
+          }
+          this.vel.set(0, 0);
+        }
+      }
+      checkWallCollisions(wallSegments) {
+        let boxBound = sqrt((this.w / 2) ** 2 + (this.h / 2) ** 2);
+        for (let i = 0, n = wallSegments.length; i < n; i++) {
+          let wall = wallSegments[i];
+          let Ax = wall.start.x, Ay = wall.start.y;
+          let Bx = wall.end.x, By = wall.end.y;
+          let Px = this.pos.x, Py = this.pos.y;
+          let ABx = Bx - Ax, ABy = wall.end.y - wall.start.y;
+          let APx = Px - Ax, APy = Py - Ay;
+          let ab2 = ABx * ABx + ABy * ABy;
+          let t = constrain((APx * ABx + APy * ABy) / ab2, 0, 1);
+          let ClosestX = Ax + ABx * t;
+          let ClosestY = Ay + ABy * t;
+          let dx = this.pos.x - ClosestX, dy = this.pos.y - ClosestY;
+          let d = sqrt(dx * dx + dy * dy);
+          if (d < boxBound) {
+            let overlap = boxBound - d;
+            let nx = dx / d, ny = dy / d;
+            this.pos.x += nx * overlap;
+            this.pos.y += ny * overlap;
+            let sepVel = this.vel.x * nx + this.vel.y * ny;
+            if (sepVel < 0) {
+              let impulse = -2 * sepVel;
+              this.vel.x += nx * impulse;
+              this.vel.y += ny * impulse;
+            }
+          }
+        }
+      }
+      display() {
+        push();
+        translate(this.pos.x, this.pos.y);
+        rotate(this.angle);
+        fill(150);
+        noStroke();
+        rectMode(CENTER);
+        let cr = min(BOX_CORNER_RADIUS, this.w / 2, this.h / 2);
+        rect(0, 0, this.w, this.h, cr);
+        pop();
+        push();
+        translate(this.pos.x, this.pos.y);
+        noStroke();
+        fill(0);
+        textAlign(CENTER, CENTER);
+        textSize(12);
+        text("Mass: 100 KG\nSize: 80 cm", 0, 0);
+        pop();
+      }
+    }
+
+    /***************** DRAG & THROW IMPLEMENTATION *****************/
+    // Instead of directly dragging the box with the mouse,
+    // when the left mouse button is pressed on a box, we store it in draggedBox.
+    // Then, in the draw loop, we apply an extra force that pulls the box toward the mouse.
+    let draggedBox = null;
+
+    function boxContains(box, x, y) {
+      let dx = x - box.pos.x;
+      let dy = y - box.pos.y;
+      let localX = dx * cos(box.angle) + dy * sin(box.angle);
+      let localY = -dx * sin(box.angle) + dy * cos(box.angle);
+      return (abs(localX) <= box.w / 2 && abs(localY) <= box.h / 2);
+    }
+
+    function mousePressed() {
+      for (let i = boxes.length - 1; i >= 0; i--) {
+        if (boxContains(boxes[i], mouseX, mouseY)) {
+          draggedBox = boxes[i];
+          return;
+        }
+      }
+    }
+
+    // No longer directly update the box's position in mouseDragged.
+    function mouseDragged() {
+      // Do nothing here.
+    }
+
+    // On mouse release, simply clear the draggedBox.
+    function mouseReleased() {
+      if (draggedBox) {
+        draggedBox = null;
+      }
+    }
+
+    /***************** p5.js SETUP, DRAW, & EVENT HANDLERS *****************/
+    function setup() {
+      createCanvas(windowWidth, windowHeight);
+      frameRate(60);
+      spawnCenter = createVector(width / 2, 50);
+
+      // Create sliders.
+      gravitySlider = createSlider(0, 1, gravityVal, 0.01);
+      gravitySlider.position(10, 10);
+      wallShakeSlider = createSlider(0, 600, wallShakeVal, 1);
+      wallShakeSlider.position(10, 40);
+      wallShakeFreqSlider = createSlider(0.01, 0.2, 0.05, 0.01);
+      wallShakeFreqSlider.position(10, 70);
+      particleSizeSlider = createSlider(1, 50, particleRadius, 1);
+      particleSizeSlider.position(10, 100);
+      // Box mass and size sliders removed (boxes are fixed at 100 KG and 80 cm).
+      gravityAngleSlider = createSlider(0, TWO_PI, PI / 2, 0.01);
+      gravityAngleSlider.position(10, 190);
+      bubbleBaseSlider = createSlider(min(width, height) * 0.3, min(width, height) * 0.6, min(width, height) * 0.45, 1);
+      bubbleBaseSlider.position(10, 220);
+      bubbleAmpSlider = createSlider(0, 100, 30, 1);
+      bubbleAmpSlider.position(10, 250);
+      // <<-- NEW: Attraction slider for pulling boxes
+      attractionSlider = createSlider(0, 0.2, 0.05, 0.01);
+      attractionSlider.position(10, 280);
+
+      explanationButton = createButton("explanation");
+      explanationButton.position(width - 120, 10);
+      explanationButton.mousePressed(() => showExplanation = !showExplanation);
+      infoButton = createButton("info");
+      infoButton.position(width - 120, 40);
+      infoButton.mousePressed(() => showInfo = !showInfo);
+      waveButton = createButton("wave: type 1");
+      waveButton.position(width - 120, 70);
+      waveButton.mousePressed(toggleWave);
+      particleCountButton = createButton("Particles: " + formatParticleCount(particleCounts[currentParticleCountIndex]));
+      particleCountButton.position(width - 120, 100);
+      particleCountButton.mousePressed(toggleParticles);
+      resetButton = createButton("RESET");
+      resetButton.position(width - 100, height - 50);
+      resetButton.style("background-color", "red");
+      resetButton.style("color", "white");
+      resetButton.mousePressed(resetEverything);
+
+      let ap = activeParticleCount;
+      for (let i = 0; i < ap; i++) {
+        particles[i] = new Particle(random(width), random(height));
+      }
+    }
+
+    function windowResized() {
+      resizeCanvas(windowWidth, windowHeight);
+    }
+
+    function draw() {
+      background(173, 216, 230); // Light blue background.
+      let w = width, h = height;
+      gravityVal = gravitySlider.value();
+      wallShakeVal = wallShakeSlider.value();
+      const wallShakeFreq = wallShakeFreqSlider.value();
+      particleRadius = particleSizeSlider.value();
+      cellSize = max(10, particleRadius * 3);
+      const gravityAngle = gravityAngleSlider.value();
+      let gcos = cos(gravityAngle), gsin = sin(gravityAngle);
+      const gravityVec = { x: gcos * gravityVal, y: gsin * gravityVal };
+
+      /***************** Wave Maker *****************/
+      let dynamicBoundary;
+      if (waveType === 1) {
+        let shake = sin(frameCount * wallShakeFreq);
+        const currentWallShake = wallShakeVal * ((shake + 1) / 2);
+        dynamicBoundary = w - currentWallShake;
+        rightWall = dynamicBoundary;
+        fill(100);
+        noStroke();
+        rect(dynamicBoundary, 0, w - dynamicBoundary, h);
+      }
+      else if (waveType === 4) {
+        let cx = width / 2, cy = height / 2;
+        let bubbleRadius = getBubbleRadius();
+        stroke(100);
+        noFill();
+        strokeWeight(2);
+        ellipse(cx, cy, bubbleRadius * 2, bubbleRadius * 2);
+        dynamicBoundary = null;
+      }
+      else {
+        let nPoints = Math.ceil(w / waveRes);
+        if (waveArray.length !== nPoints) { waveArray = new Array(nPoints); }
+        for (let i = 0; i < nPoints; i++) {
+          waveArray[i] = getWaveY(i * waveRes);
+        }
+        fill(100);
+        noStroke();
+        beginShape();
+        vertex(0, h);
+        for (let i = 0; i < nPoints; i++) {
+          vertex(i * waveRes, waveArray[i]);
+        }
+        vertex(w, h);
+        endShape(CLOSE);
+        rightWall = w;
+        dynamicBoundary = w;
+      }
+
+      /***************** Draw Spawn Area (Info Mode) *****************/
+      if (showInfo) {
+        noFill();
+        stroke(255, 0, 0);
+        strokeWeight(2);
+        ellipse(spawnCenter.x, spawnCenter.y, spawnRadius * 2);
+      }
+
+      /***************** Build the Spatial Grid *****************/
+      buildGrid();
+
+      /***************** Update & Collide Water Particles *****************/
+      let ap = activeParticleCount;
+      let bubbleBoundary;
+      if (waveType === 4) { bubbleBoundary = getBubbleRadius(); }
+      for (let i = 0; i < ap; i++) {
+        let p = particles[i];
+        p.r = particleRadius;
+        p.ax += gravityVec.x;
+        p.ay += gravityVec.y;
+        p.checkEdges(dynamicBoundary, bubbleBoundary);
+        let col = p.x / cellSize | 0;
+        let row = p.y / cellSize | 0;
+        let minDist = particleRadius * 2;
+        let minDistSq = minDist * minDist;
+        for (let j = 0, noffs = neighborOffsets.length; j < noffs; j++) {
+          let off = neighborOffsets[j];
+          let ncol = col + off[0], nrow = row + off[1];
+          if (ncol < 0 || ncol >= gridCols || nrow < 0 || nrow >= gridRows) continue;
+          let cell = grid[nrow * gridCols + ncol];
+          for (let k = 0, cellLen = cell.length; k < cellLen; k++) {
+            let other = cell[k];
+            if (other === p || other.id <= p.id) continue;
+            let dx = p.x - other.x, dy = p.y - other.y;
+            let d2 = dx * dx + dy * dy;
+            if (d2 > 0 && d2 < minDistSq) {
+              let d = sqrt(d2);
+              let overlap = minDist - d;
+              let invD = 1 / d;
+              let nx = dx * invD, ny = dy * invD;
+              let corr = overlap * 0.5;
+              p.x += nx * corr;
+              p.y += ny * corr;
+              other.x -= nx * corr;
+              other.y -= ny * corr;
+              let rvx = p.vx - other.vx;
+              let rvy = p.vy - other.vy;
+              let sepVel = rvx * nx + rvy * ny;
+              if (sepVel < 0) {
+                let impulse = -sepVel * 0.5;
+                p.vx += nx * impulse;
+                p.vy += ny * impulse;
+                other.vx -= nx * impulse;
+                other.vy -= ny * impulse;
+              }
+              let pf = overlap * 0.05;
+              p.ax += nx * pf;
+              p.ay += ny * pf;
+              other.ax -= nx * pf;
+              other.ay -= ny * pf;
+            }
+          }
+        }
+        if (waveType === 4) { p.checkWallCollisions([]); }
+        p.update();
+      }
+
+      /***************** Update & Collide Boxes *****************/
+      let bp = boxes.length;
+      for (let bi = 0; bi < bp; bi++) {
+        let box = boxes[bi];
+        // Apply gravity.
+        box.applyForce({ x: gravityVec.x * box.mass, y: gravityVec.y * box.mass });
+        // <<-- NEW: If this box is being "dragged", apply an extra force that pulls it toward the mouse.
+        if (draggedBox === box) {
+          let target = createVector(mouseX, mouseY);
+          let diff = p5.Vector.sub(target, box.pos);
+          let attractionCoefficient = attractionSlider.value(); // Controlled via slider
+          box.applyForce({
+            x: diff.x * attractionCoefficient * box.mass,
+            y: diff.y * attractionCoefficient * box.mass
+          });
+        }
+        box.update();
+        box.checkEdges();
+        if (waveType === 4) { box.checkWallCollisions([]); }
+        let rBox = sqrt((box.w * 0.5) ** 2 + (box.h * 0.5) ** 2);
+        let minX = box.pos.x - rBox, maxX = box.pos.x + rBox;
+        let minY = box.pos.y - rBox, maxY = box.pos.y + rBox;
+        let colMin = max(0, minX / cellSize | 0);
+        let colMax = min(gridCols - 1, maxX / cellSize | 0);
+        let rowMin = max(0, minY / cellSize | 0);
+        let rowMax = min(gridRows - 1, maxY / cellSize | 0);
+        let ca = cos(box.angle), sa = sin(box.angle);
+        let halfW = box.w * 0.5, halfH = box.h * 0.5;
+        for (let r = rowMin; r <= rowMax; r++) {
+          for (let c = colMin; c <= colMax; c++) {
+            let cell = grid[r * gridCols + c];
+            for (let pi = 0, plen = cell.length; pi < plen; pi++) {
+              let p = cell[pi];
+              let dx = p.x - box.pos.x, dy = p.y - box.pos.y;
+              let localX = dx * ca + dy * sa;
+              let localY = -dx * sa + dy * ca;
+              let clampedX = localX < -halfW ? -halfW : (localX > halfW ? halfW : localX);
+              let clampedY = localY < -halfH ? -halfH : (localY > halfH ? halfH : localY);
+              let diffX = localX - clampedX, diffY = localY - clampedY;
+              let dist = sqrt(diffX * diffX + diffY * diffY);
+              if (dist < p.r) {
+                let overlap = p.r - dist;
+                let nx, ny;
+                if (dist === 0) { nx = 1; ny = 0; } else { nx = diffX / dist; ny = diffY / dist; }
+                let worldNx = nx * ca - ny * sa;
+                let worldNy = nx * sa + ny * ca;
+                let totalMass = 1 + box.mass;
+                let corrP = overlap * (box.mass / totalMass);
+                let corrB = overlap * (1 / totalMass);
+                p.x += worldNx * corrP;
+                p.y += worldNy * corrP;
+                box.pos.x -= worldNx * corrB;
+                box.pos.y -= worldNy * corrB;
+                let worldContactX = clampedX * ca - clampedY * sa + box.pos.x;
+                let worldContactY = clampedX * sa + clampedY * ca + box.pos.y;
+                let rVecX = worldContactX - box.pos.x;
+                let rVecY = worldContactY - box.pos.y;
+                let boxRotVelX = -box.angularVel * rVecY;
+                let boxRotVelY = box.angularVel * rVecX;
+                let boxPtVelX = box.vel.x + boxRotVelX;
+                let boxPtVelY = box.vel.y + boxRotVelY;
+                let relVelX = p.vx - boxPtVelX;
+                let relVelY = p.vy - boxPtVelY;
+                let sepVel = relVelX * worldNx + relVelY * worldNy;
+                if (sepVel < 0) {
+                  let restitution = 0.5;
+                  let crossVal = rVecX * worldNy - rVecY * worldNx;
+                  let impulseDenom = 1 + 1 / box.mass + (crossVal * crossVal) / box.inertia;
+                  let impulseMag = -(1 + restitution) * sepVel / impulseDenom;
+                  let impulseX = worldNx * impulseMag;
+                  let impulseY = worldNy * impulseMag;
+                  p.vx += impulseX;
+                  p.vy += impulseY;
+                  box.vel.x -= impulseX / box.mass;
+                  box.vel.y -= impulseY / box.mass;
+                  let torque = rVecX * impulseY - rVecY * impulseX;
+                  box.angularVel -= torque / box.inertia;
+                }
+              }
+            }
+          }
+        }
+        box.display();
+      }
+
+      // Process Box-to-Box Collisions (Two Iterations) with softened corrections for stacking.
+      for (let iter = 0; iter < 2; iter++) {
+        for (let i = 0, n = boxes.length; i < n; i++) {
+          for (let j = i + 1; j < n; j++) {
+            let boxA = boxes[i], boxB = boxes[j];
+            let rA = sqrt((boxA.w * 0.5) ** 2 + (boxA.h * 0.5) ** 2);
+            let rB = sqrt((boxB.w * 0.5) ** 2 + (boxB.h * 0.5) ** 2);
+            if (dist(boxA.pos.x, boxA.pos.y, boxB.pos.x, boxB.pos.y) > (rA + rB)) continue;
+            let colData = satCollision(boxA, boxB);
+            if (colData.colliding) {
+              if (colData.penetration < SIMPLE_COLLISION_THRESHOLD) {
+                let invMassTotal = 1 / boxA.mass + 1 / boxB.mass;
+                let corrMag = colData.penetration / invMassTotal;
+                let corrA = p5.Vector.mult(colData.normal, corrMag / boxA.mass);
+                let corrB = p5.Vector.mult(colData.normal, corrMag / boxB.mass);
+                // Soften correction for stacking.
+                corrA.mult(0.5);
+                corrB.mult(0.5);
+                boxA.pos.sub(corrA);
+                boxB.pos.add(corrB);
+              } else {
+                let contact = p5.Vector.add(boxA.pos, boxB.pos).mult(0.5);
+                let rA_vec = p5.Vector.sub(contact, boxA.pos);
+                let rB_vec = p5.Vector.sub(contact, boxB.pos);
+                let vA_contact = p5.Vector.add(boxA.vel, createVector(-boxA.angularVel * rA_vec.y, boxA.angularVel * rA_vec.x));
+                let vB_contact = p5.Vector.add(boxB.vel, createVector(-boxB.angularVel * rB_vec.y, boxB.angularVel * rB_vec.x));
+                let relVel = p5.Vector.sub(vA_contact, vB_contact);
+                let sepVel = relVel.dot(colData.normal);
+                if (sepVel < 0) {
+                  let restitution = 0.2;
+                  let rA_cross = rA_vec.x * colData.normal.y - rA_vec.y * colData.normal.x;
+                  let rB_cross = rB_vec.x * colData.normal.y - rB_vec.y * colData.normal.x;
+                  let impulseDenom = 1 / boxA.mass + 1 / boxB.mass + (sq(rA_cross) / boxA.inertia) + (sq(rB_cross) / boxB.inertia);
+                  let impulseMag = -(1 + restitution) * sepVel / impulseDenom;
+                  let impulse = p5.Vector.mult(colData.normal, impulseMag);
+                  boxA.vel.add(p5.Vector.div(impulse, boxA.mass));
+                  boxB.vel.sub(p5.Vector.div(impulse, boxB.mass));
+                  boxA.angularVel += (rA_vec.x * impulse.y - rA_vec.y * impulse.x) / boxA.inertia;
+                  boxB.angularVel -= (rB_vec.x * impulse.y - rB_vec.y * impulse.x) / boxB.inertia;
+                }
+                let invMassTotal = 1 / boxA.mass + 1 / boxB.mass;
+                let corrMag = colData.penetration / invMassTotal;
+                let corrA = p5.Vector.mult(colData.normal, corrMag / boxA.mass);
+                let corrB = p5.Vector.mult(colData.normal, corrMag / boxB.mass);
+                boxA.pos.sub(corrA);
+                boxB.pos.add(corrB);
+              }
+            }
+          }
+        }
+      }
+
+      /***************** Build & Render Density Field for the Water Blob *****************/
+      let dCellSize = 5;
+      let dCols = Math.ceil(w / dCellSize), dRows = Math.ceil(h / dCellSize);
+      densityCols = dCols; densityRows = dRows;
+      let totalDensityCells = dCols * dRows;
+      if (density.length !== totalDensityCells) {
+        density = new Array(totalDensityCells).fill(0);
+      } else {
+        for (let i = 0; i < totalDensityCells; i++) { density[i] = 0; }
+      }
+      for (let i = 0; i < ap; i++) {
+        let p = particles[i];
+        let c = p.x / dCellSize | 0;
+        let r = p.y / dCellSize | 0;
+        if (c >= 0 && c < dCols && r >= 0 && r < dRows) {
+          let idx = r * dCols + c;
+          density[idx] += 1;
+          for (let offX = -1; offX <= 1; offX++) {
+            for (let offY = -1; offY <= 1; offY++) {
+              if (offX === 0 && offY === 0) continue;
+              let nc = c + offX, nr = r + offY;
+              if (nc >= 0 && nc < dCols && nr >= 0 && nr < dRows) {
+                density[nr * dCols + nc] += 0.3;
+              }
+            }
+          }
+        }
+      }
+      noStroke();
+      let waterColors = [
+        color(0, 180, 255),
+        color(0, 169, 244),
+        color(0, 157, 232),
+        color(0, 146, 221),
+        color(0, 135, 210),
+        color(0, 123, 198),
+        color(0, 112, 187),
+        color(0, 100, 175)
+      ];
+      let threshold = 1;
+      for (let r = 0; r < dRows; r++) {
+        for (let c = 0; c < dCols; c++) {
+          let idx = r * dCols + c;
+          if (density[idx] > threshold) {
+            let lvl = (density[idx] < 1.5) ? 0 :
+                      (density[idx] < 2.5) ? 1 :
+                      (density[idx] < 3.5) ? 2 :
+                      (density[idx] < 4.5) ? 3 :
+                      (density[idx] < 5.5) ? 4 :
+                      (density[idx] < 6.5) ? 5 :
+                      (density[idx] < 7.5) ? 6 : 7;
+            fill(waterColors[lvl]);
+            rect(c * dCellSize, r * dCellSize, dCellSize, dCellSize);
+          }
+        }
+      }
+      stroke(waterColors[0]);
+      strokeWeight(2);
+      for (let r = 0; r < dRows; r++) {
+        for (let c = 0; c < dCols; c++) {
+          let idx = r * dCols + c;
+          if (density[idx] > threshold) {
+            let x = c * dCellSize, y = r * dCellSize;
+            if (r === 0 || density[(r - 1) * dCols + c] <= threshold)
+              line(x, y, x + dCellSize, y);
+            if (c === dCols - 1 || density[r * dCols + (c + 1)] <= threshold)
+              line(x + dCellSize, y, x + dCellSize, y + dCellSize);
+            if (r === dRows - 1 || density[(r + 1) * dCols + c] <= threshold)
+              line(x, y + dCellSize, x + dCellSize, y + dCellSize);
+            if (c === 0 || density[r * dCols + (c - 1)] <= threshold)
+              line(x, y, x, y + dCellSize);
+          }
+        }
+      }
+
+      /***************** Water Arrows (Red only, filtered) *****************/
+      if (showInfo) {
+        let infoCols = Math.ceil(width / infoCellSize);
+        let infoRows = Math.ceil(height / infoCellSize);
+        if (millis() - lastInfoUpdate > infoUpdateInterval) {
+          let dGrid = new Array(infoCols * infoRows);
+          for (let i = 0; i < infoCols * infoRows; i++) { dGrid[i] = []; }
+          for (let i = 0; i < ap; i++) {
+            let p = particles[i];
+            let cx = p.x / dCellSize | 0;
+            let cy = p.y / dCellSize | 0;
+            let dIdx = cy * densityCols + cx;
+            if (density[dIdx] >= 1.5 && density[dIdx] < 2.5) {
+              let dCol = p.x / infoCellSize | 0;
+              let dRow = p.y / infoCellSize | 0;
+              dGrid[dRow * infoCols + dCol].push(p);
+            }
+          }
+          for (let r = 0; r < infoRows; r++) {
+            for (let seg = 0; seg < 3; seg++) {
+              let segStart = (seg * infoCols / 3) | 0;
+              let segEnd = (((seg + 1) * infoCols / 3)) | 0;
+              let validParticles = [];
+              for (let c = segStart; c < segEnd; c++) {
+                let idx = r * infoCols + c;
+                if (dGrid[idx].length > 0 && dGrid[idx].length < 5)
+                  validParticles = validParticles.concat(dGrid[idx]);
+              }
+              if (validParticles.length > 0) {
+                let key = r + "-" + seg;
+                arrowSelections[key] = { particle: random(validParticles), timestamp: millis() };
+              }
+            }
+          }
+          lastInfoUpdate = millis();
+        }
+        let drawnRedBases = [];
+        for (let key in arrowSelections) {
+          let sel = arrowSelections[key];
+          let chosenParticle = sel.particle;
+          if (chosenParticle && sqrt(chosenParticle.vx*chosenParticle.vx + chosenParticle.vy*chosenParticle.vy) > 0.1) {
+            let base = createVector(chosenParticle.x, chosenParticle.y);
+            let skip = false;
+            for (let otherBase of drawnRedBases) {
+              if (p5.Vector.dist(base, otherBase) < 20) { skip = true; break; }
+            }
+            if (!skip) {
+              let arrowVec = createVector(chosenParticle.vx, chosenParticle.vy).setMag(30);
+              drawArrow(base, arrowVec, color(255, 0, 0));
+              drawnRedBases.push(base);
+            }
+          }
+        }
+      }
+
+      /***************** Info Mode: Box Outlines, Velocity & Drag Arrows *****************/
+      if (showInfo) {
+        // Draw green outlines (rounded) for boxes.
+        for (let i = 0; i < boxes.length; i++) {
+          push();
+          translate(boxes[i].pos.x, boxes[i].pos.y);
+          rotate(boxes[i].angle);
+          noFill();
+          stroke(0, 255, 0);
+          strokeWeight(4);
+          let cr = min(BOX_CORNER_RADIUS, boxes[i].w / 2, boxes[i].h / 2);
+          rectMode(CENTER);
+          rect(0, 0, boxes[i].w, boxes[i].h, cr);
+          pop();
+        }
+        for (let i = 0; i < boxes.length; i++) {
+          push();
+          translate(boxes[i].pos.x, boxes[i].pos.y);
+          noStroke();
+          fill(0);
+          textAlign(CENTER, CENTER);
+          textSize(12);
+          text("Mass: 100 KG\nSize: 80 cm", 0, 0);
+          pop();
+        }
+        // Draw the black arrow (velocity) for each box.
+        let maxSpeed = 200;       // cm/s at which arrow is max length.
+        let maxArrowLength = 100; // Maximum arrow length in pixels.
+        for (let i = 0; i < boxes.length; i++) {
+          let box = boxes[i];
+          let speed = box.vel.mag() * 60;
+          if (speed > 0.1) {
+            let arrowLength = map(speed, 0, maxSpeed, 0, maxArrowLength, true);
+            let arrowDir = box.vel.copy().normalize().mult(arrowLength);
+            push();
+            stroke(0);
+            strokeWeight(3);
+            fill(0);
+            translate(box.pos.x, box.pos.y);
+            line(0, 0, arrowDir.x, arrowDir.y);
+            push();
+            translate(arrowDir.x, arrowDir.y);
+            rotate(arrowDir.heading());
+            let arrowSize = 7;
+            triangle(0, arrowSize/2, 0, -arrowSize/2, arrowSize, 0);
+            pop();
+            pop();
+          }
+        }
+        // Draw an additional (orange) "drag" arrow for each box.
+        let k_drag = 0.2; // drag coefficient (adjust for visualization)
+        let maxDragArrowLength = 50; // maximum length for the drag arrow in pixels
+        for (let i = 0; i < boxes.length; i++) {
+          let box = boxes[i];
+          if (box.vel.mag() < 0.01) continue;
+          let dragForceMag = box.vel.mag() * (k_drag * 60);
+          let dragArrowLength = map(dragForceMag, 0, 200, 0, maxDragArrowLength, true);
+          let dragArrowVec = box.vel.copy().normalize().mult(-dragArrowLength);
+          let perp = createVector(-box.vel.y, box.vel.x).normalize();
+          let offsetDistance = 10;
+          let base = box.pos.copy().add(perp.mult(offsetDistance));
+          push();
+          stroke(255, 165, 0);
+          strokeWeight(3);
+          fill(255, 165, 0);
+          translate(base.x, base.y);
+          line(0, 0, dragArrowVec.x, dragArrowVec.y);
+          push();
+          translate(dragArrowVec.x, dragArrowVec.y);
+          rotate(dragArrowVec.heading());
+          let arrowSize = 7;
+          triangle(0, arrowSize/2, 0, -arrowSize/2, arrowSize, 0);
+          pop();
+          pop();
+          push();
+          fill(255, 165, 0);
+          noStroke();
+          textSize(12);
+          let textOffset = 10;
+          text(nf(dragForceMag, 1, 1) + " drag", base.x + dragArrowVec.x + textOffset, base.y + dragArrowVec.y + textOffset);
+          pop();
+        }
+      }
+
+      /***************** On–Canvas UI Text *****************/
+      fill(0);
+      noStroke();
+      textSize(12);
+      text("Gravity: " + gravityVal, gravitySlider.x * 2 + gravitySlider.width, 25);
+      text("Wall Shake: " + wallShakeVal, wallShakeSlider.x * 2 + wallShakeSlider.width, 55);
+      text("Wave Frequency: " + wallShakeFreqSlider.value(), wallShakeFreqSlider.x * 2 + wallShakeFreqSlider.width, 85);
+      text("Particle Size: " + particleRadius, particleSizeSlider.x * 2 + particleSizeSlider.width, 115);
+      text("Gravity Angle: " + nf(degrees(gravityAngleSlider.value()), 1, 1) + "°", gravityAngleSlider.x * 2 + gravityAngleSlider.width, 205);
+      if (waveType === 4) {
+        text("Bubble Base: " + bubbleBaseSlider.value(), bubbleBaseSlider.x * 2 + bubbleBaseSlider.width, 235);
+        text("Bubble Amp: " + bubbleAmpSlider.value(), bubbleAmpSlider.x * 2 + bubbleAmpSlider.width, 265);
+      }
+      // Display the attraction slider value.
+      text("Attraction Force: " + attractionSlider.value(), attractionSlider.x * 2 + attractionSlider.width, 295);
+      let fps = frameRate();
+      fill(0);
+      noStroke();
+      textSize(14);
+      text("FPS: " + nf(fps, 1, 2), width - 80, height - 20);
+
+      if (showExplanation) {
+        fill(255, 255, 255, 200);
+        stroke(0);
+        rect(w - 420, 50, 400, 250);
+        noStroke();
+        fill(0);
+        textSize(12);
+        textWrap(WORD);
+        textAlign(LEFT, TOP);
+        text(explanationText, w - 410, 60, 380, 230);
+      }
+    }
+
+    // SAT collision detection for boxes using the rounded polygon vertices.
+    function satCollision(boxA, boxB) {
+      let cornersA = getBoxCorners(boxA);
+      let cornersB = getBoxCorners(boxB);
+      let axes = [];
+      for (let i = 0; i < cornersA.length; i++) {
+        let next = (i + 1) % cornersA.length;
+        let edge = p5.Vector.sub(cornersA[next], cornersA[i]);
+        axes.push(createVector(-edge.y, edge.x).normalize());
+      }
+      for (let i = 0; i < cornersB.length; i++) {
+        let next = (i + 1) % cornersB.length;
+        let edge = p5.Vector.sub(cornersB[next], cornersB[i]);
+        axes.push(createVector(-edge.y, edge.x).normalize());
+      }
+      let minOverlap = Infinity, smallestAxis = null;
+      for (let axis of axes) {
+        let projA = projectPolygon(axis, cornersA);
+        let projB = projectPolygon(axis, cornersB);
+        let overlap = Math.min(projA.max, projB.max) - Math.max(projA.min, projB.min);
+        if (overlap < 0) return { colliding: false, penetration: 0, normal: createVector(0, 0) };
+        if (overlap < minOverlap) {
+          minOverlap = overlap;
+          smallestAxis = axis.copy();
+          let d = p5.Vector.sub(boxB.pos, boxA.pos);
+          if (d.dot(smallestAxis) < 0) smallestAxis.mult(-1);
+        }
+      }
+      return { colliding: true, penetration: minOverlap, normal: smallestAxis };
+    }
+
+    // Projects an array of points onto an axis.
+    function projectPolygon(axis, points) {
+      let min = Infinity, max = -Infinity;
+      for (let p of points) {
+        let proj = p.dot(axis);
+        if (proj < min) min = proj;
+        if (proj > max) max = proj;
+      }
+      return { min, max };
+    }
+
+    // Rotate a vector by a given angle.
+    function rotateVector(vec, ang) {
+      let ca = cos(ang), sa = sin(ang);
+      return createVector(vec.x * ca - vec.y * sa, vec.x * sa + vec.y * ca);
+    }
+
+    // Draw an arrow from a base point along a vector.
+    function drawArrow(base, vec, myColor) {
+      push();
+      stroke(myColor);
+      strokeWeight(3);
+      fill(myColor);
+      translate(base.x, base.y);
+      line(0, 0, vec.x, vec.y);
+      rotate(vec.heading());
+      let arrowSize = 7;
+      translate(vec.mag() - arrowSize, 0);
+      triangle(0, arrowSize / 2, 0, -arrowSize / 2, arrowSize, 0);
+      pop();
+    }
+
+    // Key handler: 'p' adds a box; Ctrl/Cmd+Z removes the last box.
+    function keyPressed() {
+      if (key === 'p' || key === 'P') {
+        // Every new box is fixed: 80 cm square, 100 kg.
+        boxes.push(new Box(mouseX, mouseY, 80, 80, 100));
+      } else if ((keyIsDown(CONTROL) || keyIsDown(META)) && keyCode === 90) {
+        if (boxes.length > 0) { boxes.pop(); }
+        return false;
+      }
+    }
+  </script>
+</body>
+</html>
